@@ -1,0 +1,169 @@
+name: SonarQube Remote Scan and n8n Trigger
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  # The URL of your remote SonarQube server
+  SONAR_HOST_URL: "https://sonarqube.kadellabs.com" 
+
+  # The port for your remote SonarQube server (443 for https://)
+  SONAR_PORT: 443 
+
+  SONAR_PROJECT_KEY: test_n8n_rocketlane
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  SECURITY_GROUP_ID: ${{ secrets.SECURITY_GROUP_ID }}
+
+jobs:
+  build-and-scan:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Required for SonarQube
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set up Java (for Sonar Scanner)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Download and set up Sonar Scanner
+        run: |
+          echo "📥 Downloading Sonar Scanner CLI..."
+          # Try multiple download methods
+          if command -v wget &> /dev/null; then
+            wget --timeout=30 --tries=3 -q \
+              "https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-6.2.1.4610-linux-x64.zip" \
+              -O sonar-scanner.zip
+          elif command -v curl &> /dev/null; then
+            curl -L --max-time 30 --retry 3 \
+              "https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-6.2.1.4610-linux-x64.zip" \
+              -o sonar-scanner.zip
+          else
+            echo "::error::Neither wget nor curl is available"
+            exit 1
+          fi
+          # Check if file was downloaded
+          if [ ! -f sonar-scanner.zip ]; then
+            echo "::error::Failed to download sonar-scanner.zip"
+            exit 1
+          fi
+          # Check file size (should be > 50MB)
+          FILE_SIZE=$(stat -f%z sonar-scanner.zip 2>/dev/null || stat -c%s sonar-scanner.zip 2>/dev/null)
+          if [ "$FILE_SIZE" -lt 50000000 ]; then
+            echo "::error::Downloaded file is too small ($FILE_SIZE bytes). Possible download failure."
+            echo "File contents:"
+            head -c 1000 sonar-scanner.zip
+            exit 1
+          fi
+          # Verify it's a valid zip file
+          if ! unzip -t sonar-scanner.zip > /dev/null 2>&1; then
+            echo "::error::Downloaded file 'sonar-scanner.zip' is not a valid zip archive."
+            echo "This often means a network or firewall issue blocked the download."
+            echo "First 1000 bytes of file:"
+            head -c 1000 sonar-scanner.zip
+            exit 1
+          fi
+          echo "✅ File downloaded successfully. Unzipping..."
+          unzip -q sonar-scanner.zip
+          # Find the scanner directory
+          SONAR_SCANNER_DIR=$(find . -maxdepth 1 -type d -name "sonar-scanner-*-linux*" | head -n 1)
+          if [ -z "$SONAR_SCANNER_DIR" ]; then
+            echo "::error::Could not find sonar-scanner directory after extraction"
+            ls -la
+            exit 1
+          fi
+          echo "Found scanner at: $SONAR_SCANNER_DIR"
+          echo "$SONAR_SCANNER_DIR/bin" >> $GITHUB_PATH
+          # Verify the scanner binary exists and is executable
+          if [ ! -f "$SONAR_SCANNER_DIR/bin/sonar-scanner" ]; then
+            echo "::error::sonar-scanner binary not found in extracted directory"
+            exit 1
+          fi
+          chmod +x "$SONAR_SCANNER_DIR/bin/sonar-scanner"
+          echo "✅ Sonar Scanner setup complete"
+      - name: 🔓 Open SonarQube Port in AWS Firewall
+        run: |
+          echo "🔓 Opening port ${{ env.SONAR_PORT }} in Security Group ${{ env.SECURITY_GROUP_ID }}..."
+          aws ec2 authorize-security-group-ingress \
+            --group-id ${{ env.SECURITY_GROUP_ID }} \
+            --protocol tcp \
+            --port ${{ env.SONAR_PORT }} \
+            --cidr 0.0.0.0/0 2>&1 | grep -v "InvalidPermission.Duplicate" || true
+          echo "✅ Port ${{ env.SONAR_PORT }} opened temporarily."
+      - name: Verify SonarQube Server Connectivity
+        run: |
+          echo "🔍 Testing connection to SonarQube server..."
+          if curl -k -s --connect-timeout 10 "${{ env.SONAR_HOST_URL }}/api/system/status" > /dev/null; then
+            echo "✅ SonarQube server is reachable"
+          else
+            echo "⚠️ Warning: Could not reach SonarQube server. Scan may fail."
+          fi
+      - name: Run SonarQube Scanner
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: |
+          echo "🔍 Running SonarQube scan..."
+          sonar-scanner \
+            -Dsonar.host.url=${{ env.SONAR_HOST_URL }} \
+            -Dsonar.token=${{ env.SONAR_TOKEN }} \
+            -Dsonar.projectKey=${{ env.SONAR_PROJECT_KEY }} \
+            -Dsonar.sources=. \
+            -Dsonar.exclusions=**/node_modules/**,**/.git/**,**/dist/**,**/build/**
+          echo "✅ SonarQube scan completed"
+      - name: 🔒 Close SonarQube Port in AWS Firewall
+        if: always() # This MUST run even if the scan fails
+        run: |
+          echo "🔒 Removing temporary access for port ${{ env.SONAR_PORT }}..."
+          aws ec2 revoke-security-group-ingress \
+            --group-id ${{ env.SECURITY_GROUP_ID }} \
+            --protocol tcp \
+            --port ${{ env.SONAR_PORT }} \
+            --cidr 0.0.0.0/0 2>&1 | grep -v "InvalidPermission.NotFound" || true
+          echo "✅ Port ${{ env.SONAR_PORT }} access revoked."
+      - name: Notify n8n Workflow
+        if: always()
+        env:
+          N8N_WEBHOOK_URL: ${{ secrets.N8N_WEBHOOK_URL }}
+        run: |
+          STATUS_JSON=$(echo '${{ job.status }}' | tr '[:upper:]' '[:lower:]')
+          SCAN_STATUS="failed"
+          if [ "$STATUS_JSON" == "success" ]; then
+            SCAN_STATUS="completed"
+          fi
+          # Build the JSON payload
+          JSON_BODY=$(cat <<EOF
+          {
+            "projectKey": "${{ env.SONAR_PROJECT_KEY }}",
+            "status": "$STATUS_JSON",
+            "repository": "$GITHUB_REPOSITORY",
+            "branch": "$GITHUB_REF_NAME",
+            "commit": "$GITHUB_SHA",
+            "scanStatus": "$SCAN_STATUS",
+            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          }
+          EOF
+          )
+          echo "📤 Sending notification to n8n..."
+          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+               -H "Content-Type: application/json" \
+               -d "$JSON_BODY" \
+               "${{ env.N8N_WEBHOOK_URL }}")
+          HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+          if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+            echo "✅ n8n notification sent successfully (HTTP $HTTP_CODE)"
+          else
+            echo "⚠️ n8n notification may have failed (HTTP $HTTP_CODE)"
+          fi

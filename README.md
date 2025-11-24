@@ -1,6 +1,6 @@
 # CustomerXPS - AI-Powered Support Ticket Analysis
 
-Agentic system that automatically analyzes Freshdesk support tickets using AI embeddings to find similar past tickets and provide intelligent summaries.
+Agentic system that automatically analyzes Freshdesk support tickets using AI embeddings to find similar past tickets and provide intelligent summaries..
 
 ## Features
 
